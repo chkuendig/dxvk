@@ -225,17 +225,151 @@ namespace dxvk {
   }
 
 
+  /* Blit a DXVK image into our external buffer. The data flow is one-way:
+   * DXVK (current image contents) → external buffer → CUDA reads via
+   * hipExternalMemoryGetMappedBuffer. Synchronisation is CPU-side because
+   * hipImportExternalSemaphore is stubbed on Linux ROCm; this introduces
+   * a per-Map stall on the order of a few hundred microseconds, which
+   * matches PhysX' Map-then-launch cadence well enough.
+   *
+   * Note that we currently assume R32G32B32A32_FLOAT (16 B/pixel) and a
+   * single mip / single array layer. The PE-side caller validates the
+   * descriptor before reaching here, so anything else would already have
+   * fallen back to the public cuGraphicsD3D11RegisterResource path. */
   HRESULT STDMETHODCALLTYPE D3D11VkInterop::CopySurfaceToExternalBuffer(
           IDXGIVkInteropSurface*  pSrc,
           VkBuffer                Dst,
           UINT64                  DstSize,
           UINT                    DstRowPitch) {
-    /* TODO: submit vkCmdCopyImageToBuffer on the DXVK queue and wait via
-     * a CPU-side fence. For the first iteration of this interface the
-     * caller (ZLUDA) gets uninitialised memory in the buffer; the
-     * register/import path can still be validated end-to-end without a
-     * working blit. PhysX will read zeros. */
-    Logger::warn("D3D11VkInterop::CopySurfaceToExternalBuffer: blit not yet implemented");
+    if (!pSrc || Dst == VK_NULL_HANDLE)
+      return E_POINTER;
+
+    auto device = m_device->GetDXVKDevice();
+    auto vkd    = device->vkd();
+
+    /* GetVulkanImageInfo gives us the VkImage, the layout DXVK left it in,
+     * and the original VkImageCreateInfo so we know extent + mip/array
+     * counts. */
+    VkImage           srcImage  = VK_NULL_HANDLE;
+    VkImageLayout     srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageCreateInfo srcInfo   = { };
+    if (FAILED(pSrc->GetVulkanImageInfo(&srcImage, &srcLayout, &srcInfo)) || !srcImage) {
+      Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: GetVulkanImageInfo failed");
+      return E_FAIL;
+    }
+
+    /* Drain DXVK's CS thread so any queued draws against the source image
+     * are visible by the time we submit our copy. lockSubmission keeps
+     * DXVK from interleaving its own submits while ours is in flight. */
+    FlushRenderingCommands();
+    device->lockSubmission();
+
+    /* Per-call command pool / fence — Batman maps in batches of 6–12 a few
+     * times per second, so the create/destroy overhead is small relative
+     * to the GPU stall on vkWaitForFences. Could be cached if profiling
+     * shows it matters. */
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    poolInfo.queueFamilyIndex = device->queues().graphics.queueFamily;
+    poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    if (vkd->vkCreateCommandPool(vkd->device(), &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkCreateCommandPool failed");
+      device->unlockSubmission();
+      return E_FAIL;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmdAlloc = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAlloc.commandPool        = pool;
+    cmdAlloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    if (vkd->vkAllocateCommandBuffers(vkd->device(), &cmdAlloc, &cmd) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkAllocateCommandBuffers failed");
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      return E_FAIL;
+    }
+
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkd->vkBeginCommandBuffer(cmd, &begin);
+
+    VkImageSubresourceRange range = {
+      VK_IMAGE_ASPECT_COLOR_BIT, 0, srcInfo.mipLevels, 0, srcInfo.arrayLayers
+    };
+
+    /* Transition srcLayout → TRANSFER_SRC_OPTIMAL.  We use the broad
+     * ALL_COMMANDS / MEMORY masks because we don't know what stage left the
+     * image in srcLayout — anything is conservatively correct here. */
+    VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    toSrc.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    toSrc.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.oldLayout           = srcLayout;
+    toSrc.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.image               = srcImage;
+    toSrc.subresourceRange    = range;
+    vkd->vkCmdPipelineBarrier(cmd,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    /* Copy the whole mip 0 layer 0 into the external buffer. We assume
+     * R32G32B32A32_FLOAT (16 B/pixel) for the row-length conversion. The
+     * caller has already validated this; if it ever isn't, the CUDA
+     * consumer would also be wrong. */
+    constexpr uint32_t bytesPerPixel = 16; /* R32G32B32A32_FLOAT */
+    VkBufferImageCopy region = { };
+    region.bufferOffset      = 0;
+    region.bufferRowLength   = DstRowPitch ? (DstRowPitch / bytesPerPixel) : 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageOffset       = { 0, 0, 0 };
+    region.imageExtent       = srcInfo.extent;
+    vkd->vkCmdCopyImageToBuffer(cmd, srcImage,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Dst, 1, &region);
+
+    /* Transition back to whatever DXVK had it in. */
+    VkImageMemoryBarrier toOrig = toSrc;
+    toOrig.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toOrig.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    toOrig.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toOrig.newLayout     = srcLayout;
+    vkd->vkCmdPipelineBarrier(cmd,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      0, 0, nullptr, 0, nullptr, 1, &toOrig);
+
+    vkd->vkEndCommandBuffer(cmd);
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkd->vkCreateFence(vkd->device(), &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkCreateFence failed");
+      vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      return E_FAIL;
+    }
+
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &cmd;
+    auto queue = device->queues().graphics.queueHandle;
+    if (vkd->vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkQueueSubmit failed");
+      vkd->vkDestroyFence(vkd->device(), fence, nullptr);
+      vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      return E_FAIL;
+    }
+
+    vkd->vkWaitForFences(vkd->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+
+    vkd->vkDestroyFence(vkd->device(), fence, nullptr);
+    vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+    vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+    device->unlockSubmission();
     return S_OK;
   }
 
