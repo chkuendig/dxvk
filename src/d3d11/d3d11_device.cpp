@@ -3305,8 +3305,19 @@ namespace dxvk {
       return S_OK;
     }
     
+    /* IDXGIVkInteropDevice2 — fork extension. Compare by raw GUID bytes
+     * because __uuidof(IDXGIVkInteropDevice2) doesn't seem to pick up our
+     * __CRT_UUID_DECL in this build env (root cause unclear; works for the
+     * v1/base interfaces). The literal here matches the GUID in
+     * dxgi_interfaces.h and IID_IDXGIVkInteropDevice2 in the consumer
+     * (nvidia-libs/.../d3d11_interop.c). */
+    static const GUID kIDXGIVkInteropDevice2 = {
+      0xe2ef5fa5, 0xdc21, 0x4af7, { 0x90, 0xc4, 0xf6, 0x7e, 0xf6, 0xa0, 0x93, 0x25 }
+    };
     if (riid == __uuidof(IDXGIVkInteropDevice)
-     || riid == __uuidof(IDXGIVkInteropDevice1)) {
+     || riid == __uuidof(IDXGIVkInteropDevice1)
+     || riid == __uuidof(IDXGIVkInteropDevice2)
+     || riid == kIDXGIVkInteropDevice2) {
       *ppvObject = ref(&m_d3d11Interop);
       return S_OK;
     }

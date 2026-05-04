@@ -416,6 +416,91 @@ IDXGIVkInteropDevice1 : public IDXGIVkInteropDevice {
 };
 
 /**
+ * \brief DXVK D3D11 / Vulkan interop device — ZLUDA D3D11 texture-interop
+ *        extensions.
+ *
+ * Adds methods that allocate Vulkan memory with VK_KHR_external_memory_win32
+ * export bits and copy DXVK-owned image data into it. Used by ZLUDA / CUDA
+ * D3D11 texture interop because the relevant KHR extension functions
+ * (vkGetMemoryWin32HandleKHR / vkGetMemoryFdKHR) cannot be resolved from
+ * application PE-side code in Wine — they only exist inside DXVK's
+ * per-device function table. Exposing them through the DXVK interop
+ * interface lets the consumer (eg nvidia-libs/nvcuda's
+ * wine_cuGraphicsD3D11RegisterResource) hand a Win32 HANDLE off to its own
+ * NT→fd translator and then to libcuda.so::hipImportExternalMemory.
+ *
+ * The DXVK fork containing this interface is the chkuendig/dxvk fork on
+ * branch zluda-physx; upstream DXVK does not have this method set.
+ */
+MIDL_INTERFACE("e2ef5fa5-dc21-4af7-90c4-f67ef6a09325")
+IDXGIVkInteropDevice2 : public IDXGIVkInteropDevice1 {
+  /**
+   * \brief Allocate an exportable VkBuffer + VkDeviceMemory pair.
+   *
+   * The buffer is created with VK_BUFFER_USAGE_TRANSFER_DST_BIT and
+   * VK_BUFFER_USAGE_TRANSFER_SRC_BIT so the caller can later use
+   * CopySurfaceToExternalBuffer to populate it. Memory is allocated with
+   * VkExportMemoryAllocateInfo{OPAQUE_WIN32_BIT}; the returned HANDLE
+   * wraps the underlying kernel resource (a dma_buf fd on Linux/Wine,
+   * an actual Win32 HANDLE on Windows).
+   *
+   * Caller owns the returned VkBuffer and VkDeviceMemory and must call
+   * FreeExternalBuffer to release them. The HANDLE is owned by the
+   * caller; closing it is required to release the export reference.
+   *
+   * \param [in]  Size            Requested allocation size in bytes
+   * \param [out] pHandle         NT HANDLE wrapping the underlying memory
+   * \param [out] pBufferOut      VkBuffer bound to the allocated memory
+   * \param [out] pMemoryOut      VkDeviceMemory backing the buffer
+   * \param [out] pAllocSizeOut   Actual allocation size (may exceed Size
+   *                              due to Vulkan alignment requirements)
+   * \returns S_OK on success, E_FAIL if any Vulkan call failed
+   */
+  virtual HRESULT STDMETHODCALLTYPE AllocateExternalBuffer(
+          UINT64                Size,
+          HANDLE*               pHandle,
+          VkBuffer*             pBufferOut,
+          VkDeviceMemory*       pMemoryOut,
+          UINT64*               pAllocSizeOut) = 0;
+
+  /**
+   * \brief Copy a DXVK image into an external buffer.
+   *
+   * Submits vkCmdCopyImageToBuffer on the DXVK queue, waits on a fence,
+   * and returns when the GPU is done. After this returns, Dst contains
+   * the source image's pixels in linear (row-major) layout.
+   *
+   * Synchronisation is CPU-side because hipImportExternalSemaphore is
+   * stubbed on Linux ROCm; this introduces a per-Map stall but keeps
+   * the design simple. Future work could use a Vulkan fence exported
+   * via VK_KHR_external_fence_win32 for GPU-side sync.
+   *
+   * \param [in] pSrc       Source DXVK image (any layout)
+   * \param [in] Dst        Destination buffer from AllocateExternalBuffer
+   * \param [in] DstSize    Buffer size for bounds check (bytes)
+   * \param [in] DstRowPitch Pitch of dst rows (bytes; 0 = tight pack)
+   * \returns S_OK on success
+   */
+  virtual HRESULT STDMETHODCALLTYPE CopySurfaceToExternalBuffer(
+          IDXGIVkInteropSurface*  pSrc,
+          VkBuffer                Dst,
+          UINT64                  DstSize,
+          UINT                    DstRowPitch) = 0;
+
+  /**
+   * \brief Release a buffer + memory pair created by AllocateExternalBuffer.
+   *
+   * Does NOT close the HANDLE — that's the caller's responsibility (and
+   * for Wine the HANDLE may have been translated to a fd already, in
+   * which case closing it is wrong). Callers must close the HANDLE
+   * separately or transfer ownership.
+   */
+  virtual void STDMETHODCALLTYPE FreeExternalBuffer(
+          VkBuffer        Buffer,
+          VkDeviceMemory  Memory) = 0;
+};
+
+/**
  * \brief DXGI adapter interface for Vulkan interop
  *
  * Provides access to the physical device and
@@ -474,6 +559,7 @@ __CRT_UUID_DECL(IDXGIVkInteropFactory1,    0x2a289dbd,0x2d0a,0x4a51,0x89,0xf7,0x
 __CRT_UUID_DECL(IDXGIVkInteropAdapter,     0x3a6d8f2c,0xb0e8,0x4ab4,0xb4,0xdc,0x4f,0xd2,0x48,0x91,0xbf,0xa5);
 __CRT_UUID_DECL(IDXGIVkInteropDevice,      0xe2ef5fa5,0xdc21,0x4af7,0x90,0xc4,0xf6,0x7e,0xf6,0xa0,0x93,0x23);
 __CRT_UUID_DECL(IDXGIVkInteropDevice1,     0xe2ef5fa5,0xdc21,0x4af7,0x90,0xc4,0xf6,0x7e,0xf6,0xa0,0x93,0x24);
+__CRT_UUID_DECL(IDXGIVkInteropDevice2,     0xe2ef5fa5,0xdc21,0x4af7,0x90,0xc4,0xf6,0x7e,0xf6,0xa0,0x93,0x25);
 __CRT_UUID_DECL(IDXGIVkInteropSurface,     0x5546cf8c,0x77e7,0x4341,0xb0,0x5d,0x8d,0x4d,0x50,0x00,0xe7,0x7d);
 __CRT_UUID_DECL(IDXGIVkSurfaceFactory,     0x1e7895a1,0x1bc3,0x4f9c,0xa6,0x70,0x29,0x0a,0x4b,0xc9,0x58,0x1a);
 __CRT_UUID_DECL(IDXGIVkSwapChain,          0xe4a9059e,0xb569,0x46ab,0x8d,0xe7,0x50,0x1b,0xd2,0xbc,0x7f,0x7a);
