@@ -42,6 +42,10 @@ namespace dxvk {
     HANDLE_EXT(extVertexAttributeDivisor);         \
     HANDLE_EXT(khrExternalMemoryWin32);            \
     HANDLE_EXT(khrExternalSemaphoreWin32);         \
+    HANDLE_EXT(khrExternalMemoryFd);               \
+    HANDLE_EXT(extExternalMemoryDmaBuf);           \
+    HANDLE_EXT(khrExternalSemaphoreFd);            \
+    HANDLE_EXT(khrExternalFenceFd);                \
     HANDLE_EXT(khrLoadStoreOpNone);                \
     HANDLE_EXT(khrMaintenance5);                   \
     HANDLE_EXT(khrMaintenance6);                   \
@@ -865,6 +869,12 @@ namespace dxvk {
       /* External memory features for wine */
       ENABLE_EXT(khrExternalMemoryWin32, false),
       ENABLE_EXT(khrExternalSemaphoreWin32, false),
+
+      /* ZLUDA: Linux external-memory FD variants for D3D11<->CUDA interop */
+      ENABLE_EXT(khrExternalMemoryFd, false),
+      ENABLE_EXT(extExternalMemoryDmaBuf, false),
+      ENABLE_EXT(khrExternalSemaphoreFd, false),
+      ENABLE_EXT(khrExternalFenceFd, false),
 
       /* LOAD_OP_NONE for certain tiler optimizations */
       ENABLE_EXT(khrLoadStoreOpNone, false),
