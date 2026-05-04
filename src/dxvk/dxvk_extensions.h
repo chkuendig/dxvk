@@ -321,6 +321,14 @@ namespace dxvk {
     DxvkExt extVertexAttributeDivisor         = { VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt khrExternalMemoryWin32            = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt khrExternalSemaphoreWin32         = { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,           DxvkExtMode::Optional };
+    /* Linux external-memory variants — required by ZLUDA D3D11 interop so that
+     * libcuda.so can hipImportExternalMemory a dma_buf fd handed to it from
+     * the DXVK side (vkGetMemoryFdKHR). Optional so DXVK still works on
+     * platforms that don't expose them (eg legacy nvidia closed driver pre-470). */
+    DxvkExt khrExternalMemoryFd               = { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,                 DxvkExtMode::Optional };
+    DxvkExt extExternalMemoryDmaBuf           = { VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,            DxvkExtMode::Optional };
+    DxvkExt khrExternalSemaphoreFd            = { VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,              DxvkExtMode::Optional };
+    DxvkExt khrExternalFenceFd                = { VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt khrMaintenance5                   = { VK_KHR_MAINTENANCE_5_EXTENSION_NAME,                      DxvkExtMode::Optional };
     DxvkExt khrPipelineLibrary                = { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,                   DxvkExtMode::Optional };
     DxvkExt khrPresentId                      = { VK_KHR_PRESENT_ID_EXTENSION_NAME,                         DxvkExtMode::Optional };
