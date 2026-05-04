@@ -8,7 +8,7 @@ namespace dxvk {
 
   class D3D11Device;
   
-  class D3D11VkInterop : public ComObject<IDXGIVkInteropDevice1> {
+  class D3D11VkInterop : public ComObject<IDXGIVkInteropDevice2> {
     
   public:
     
@@ -56,7 +56,26 @@ namespace dxvk {
             const D3D11_TEXTURE2D_DESC1* pDesc,
             VkImage                      vkImage,
             ID3D11Texture2D**            ppTexture2D);
-    
+
+    /* IDXGIVkInteropDevice2 — ZLUDA D3D11 texture interop extensions. */
+
+    HRESULT STDMETHODCALLTYPE AllocateExternalBuffer(
+            UINT64                Size,
+            HANDLE*               pHandle,
+            VkBuffer*             pBufferOut,
+            VkDeviceMemory*       pMemoryOut,
+            UINT64*               pAllocSizeOut);
+
+    HRESULT STDMETHODCALLTYPE CopySurfaceToExternalBuffer(
+            IDXGIVkInteropSurface*  pSrc,
+            VkBuffer                Dst,
+            UINT64                  DstSize,
+            UINT                    DstRowPitch);
+
+    void STDMETHODCALLTYPE FreeExternalBuffer(
+            VkBuffer        Buffer,
+            VkDeviceMemory  Memory);
+
   private:
     
     IDXGIObject* m_container;
