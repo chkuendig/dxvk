@@ -76,6 +76,12 @@ namespace dxvk {
             VkBuffer        Buffer,
             VkDeviceMemory  Memory);
 
+    HRESULT STDMETHODCALLTYPE CopyExternalBufferToSurface(
+            VkBuffer                Src,
+            UINT64                  SrcSize,
+            UINT                    SrcRowPitch,
+            IDXGIVkInteropSurface*  pDst);
+
   private:
     
     IDXGIObject* m_container;

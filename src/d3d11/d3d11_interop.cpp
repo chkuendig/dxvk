@@ -6,6 +6,8 @@
 #include "../dxvk/dxvk_device.h"
 #include "../dxvk/dxvk_instance.h"
 
+#include <atomic>
+
 namespace dxvk {
   
   D3D11VkInterop::D3D11VkInterop(
@@ -249,42 +251,58 @@ namespace dxvk {
 
     /* GetVulkanImageInfo gives us the VkImage, the layout DXVK left it in,
      * and the original VkImageCreateInfo so we know extent + mip/array
-     * counts AND usage flags. */
+     * counts AND usage flags.
+     *
+     * D3D11VkInteropSurface::GetVulkanImageInfo (d3d11_texture.cpp) rejects
+     * the call with E_INVALIDARG unless pInfo->sType is set to
+     * VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO and pNext is null — easy to miss
+     * because no other Vulkan struct that we hand TO Vulkan needs sType
+     * pre-set when DXVK is the one filling it in. Without this line the
+     * function returns failure, the blit never runs, and CUDA reads
+     * uninitialised memory (silent data corruption — burned a session on
+     * mis-diagnosing this as a TRANSFER_SRC_BIT issue). */
     VkImage           srcImage  = VK_NULL_HANDLE;
     VkImageLayout     srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageCreateInfo srcInfo   = { };
+    srcInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     if (FAILED(pSrc->GetVulkanImageInfo(&srcImage, &srcLayout, &srcInfo)) || !srcImage) {
       Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: GetVulkanImageInfo failed");
       return E_FAIL;
     }
 
-    /* DXVK only sets VK_IMAGE_USAGE_TRANSFER_SRC_BIT on textures that have
-     * a use case for it (staging copies, mip generation, …). Batman's PhysX
-     * field-sampler textures are typically created as SRV+RTV with no
-     * transfer-src usage, which makes vkCmdCopyImageToBuffer illegal — we
-     * observed this manifesting as a UTCL2 page fault in dxvk-submit (TCP
-     * client, RW=write) on Steam Deck gfx1033. The principled fix needs
-     * either a parallel staging image (created with TRANSFER_SRC) that DXVK
-     * blits the original into, or an upstream DXVK hint to OR
-     * TRANSFER_SRC_BIT into texture creation when ZLUDA register hooks into
-     * the resource. Until that's wired, refuse the copy and let CUDA see
-     * the uninitialised buffer (same effective state as iter17b — register/
-     * import is still validated end-to-end). */
+    /* Defensive: every D3D11Texture in DXVK is created with TRANSFER_SRC_BIT
+     * (d3d11_texture.cpp:38) so this branch should never fire. Keep the
+     * check + one-time warning so we get a loud signal if a future DXVK
+     * change drops the bit conditionally. */
     if (!(srcInfo.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
       static bool warned_once = false;
       if (!warned_once) {
         Logger::warn("D3D11VkInterop::CopySurfaceToExternalBuffer: source "
-                     "image lacks VK_IMAGE_USAGE_TRANSFER_SRC_BIT; "
-                     "imported memory will not be refreshed (warning logged once)");
+                     "image lacks VK_IMAGE_USAGE_TRANSFER_SRC_BIT — "
+                     "DXVK contract changed?");
         warned_once = true;
       }
-      return S_OK;
+      return E_FAIL;
     }
 
-    /* Drain DXVK's CS thread so any queued draws against the source image
-     * are visible by the time we submit our copy. lockSubmission keeps
-     * DXVK from interleaving its own submits while ours is in flight. */
+    /* Use DXVK's TransitionSurfaceLayout to let DXVK's CS-thread bookkeeping
+     * track the layout change. Bypassing it (with a raw vkCmdPipelineBarrier
+     * on a private command buffer) caused dxvk-submit page faults roughly
+     * half the time on gfx1033 — RADV disables DCC compression metadata on
+     * the transition out of COLOR_ATTACHMENT_OPTIMAL, and DXVK's next use
+     * of the image read decompressed bytes through DCC-expecting paths.
+     * TransitionSurfaceLayout queues to the CS thread; FlushRenderingCommands
+     * drains and submits, so by the time we lockSubmission the image is in
+     * TRANSFER_SRC_OPTIMAL and DXVK knows. */
+    VkImageSubresourceRange range = {
+      VK_IMAGE_ASPECT_COLOR_BIT, 0, srcInfo.mipLevels, 0, srcInfo.arrayLayers
+    };
+
+    TransitionSurfaceLayout(pSrc, &range, srcLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     FlushRenderingCommands();
+
+    /* lockSubmission keeps DXVK from interleaving its own submits while ours
+     * is in flight. CS thread is already drained by FlushRenderingCommands. */
     device->lockSubmission();
 
     /* Per-call command pool / fence — Batman maps in batches of 6–12 a few
@@ -298,6 +316,8 @@ namespace dxvk {
     if (vkd->vkCreateCommandPool(vkd->device(), &poolInfo, nullptr, &pool) != VK_SUCCESS) {
       Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkCreateCommandPool failed");
       device->unlockSubmission();
+      TransitionSurfaceLayout(pSrc, &range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcLayout);
+      FlushRenderingCommands();
       return E_FAIL;
     }
 
@@ -310,6 +330,8 @@ namespace dxvk {
       Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: vkAllocateCommandBuffers failed");
       vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
       device->unlockSubmission();
+      TransitionSurfaceLayout(pSrc, &range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcLayout);
+      FlushRenderingCommands();
       return E_FAIL;
     }
 
@@ -317,30 +339,9 @@ namespace dxvk {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkd->vkBeginCommandBuffer(cmd, &begin);
 
-    VkImageSubresourceRange range = {
-      VK_IMAGE_ASPECT_COLOR_BIT, 0, srcInfo.mipLevels, 0, srcInfo.arrayLayers
-    };
-
-    /* Transition srcLayout → TRANSFER_SRC_OPTIMAL.  We use the broad
-     * ALL_COMMANDS / MEMORY masks because we don't know what stage left the
-     * image in srcLayout — anything is conservatively correct here. */
-    VkImageMemoryBarrier toSrc = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-    toSrc.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    toSrc.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
-    toSrc.oldLayout           = srcLayout;
-    toSrc.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.image               = srcImage;
-    toSrc.subresourceRange    = range;
-    vkd->vkCmdPipelineBarrier(cmd,
-      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      0, 0, nullptr, 0, nullptr, 1, &toSrc);
-
-    /* Copy the whole mip 0 layer 0 into the external buffer. We assume
-     * R32G32B32A32_FLOAT (16 B/pixel) for the row-length conversion. The
-     * caller has already validated this; if it ever isn't, the CUDA
-     * consumer would also be wrong. */
+    /* Image is already in TRANSFER_SRC_OPTIMAL via DXVK's transition above —
+     * just record the copy itself. We assume R32G32B32A32_FLOAT (16 B/pixel)
+     * for the row-length conversion; PE-side caller validates this format. */
     constexpr uint32_t bytesPerPixel = 16; /* R32G32B32A32_FLOAT */
     VkBufferImageCopy region = { };
     region.bufferOffset      = 0;
@@ -351,16 +352,6 @@ namespace dxvk {
     region.imageExtent       = srcInfo.extent;
     vkd->vkCmdCopyImageToBuffer(cmd, srcImage,
       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, Dst, 1, &region);
-
-    /* Transition back to whatever DXVK had it in. */
-    VkImageMemoryBarrier toOrig = toSrc;
-    toOrig.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toOrig.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    toOrig.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toOrig.newLayout     = srcLayout;
-    vkd->vkCmdPipelineBarrier(cmd,
-      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-      0, 0, nullptr, 0, nullptr, 1, &toOrig);
 
     vkd->vkEndCommandBuffer(cmd);
 
@@ -384,6 +375,8 @@ namespace dxvk {
       vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
       vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
       device->unlockSubmission();
+      TransitionSurfaceLayout(pSrc, &range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcLayout);
+      FlushRenderingCommands();
       return E_FAIL;
     }
 
@@ -393,6 +386,23 @@ namespace dxvk {
     vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
     vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
     device->unlockSubmission();
+
+    /* Hand the image back to DXVK in its original layout. */
+    TransitionSurfaceLayout(pSrc, &range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, srcLayout);
+    FlushRenderingCommands();
+
+    /* Positive trace: log the FIRST successful blit so we can verify in the
+     * dxvk log that the path actually executed end-to-end (not just
+     * returned S_OK silently). One-shot to avoid spam. */
+    static std::atomic<bool> first_blit_logged { false };
+    bool expected = false;
+    if (first_blit_logged.compare_exchange_strong(expected, true)) {
+      Logger::warn(str::format("D3D11VkInterop::CopySurfaceToExternalBuffer: "
+                               "first blit submitted+waited OK ",
+                               srcInfo.extent.width, "x", srcInfo.extent.height,
+                               " fmt=", srcInfo.format,
+                               " pitch=", DstRowPitch, " size=", DstSize));
+    }
     return S_OK;
   }
 
@@ -403,6 +413,147 @@ namespace dxvk {
     auto vkd = m_device->GetDXVKDevice()->vkd();
     if (Buffer != VK_NULL_HANDLE) vkd->vkDestroyBuffer(vkd->device(), Buffer, nullptr);
     if (Memory != VK_NULL_HANDLE) vkd->vkFreeMemory(vkd->device(), Memory, nullptr);
+  }
+
+
+  /* Reverse blit — propagate CUDA-written buffer contents back into the
+   * DXVK image so D3D11's next sample sees them. Mirror of
+   * CopySurfaceToExternalBuffer with vkCmdCopyBufferToImage and inverted
+   * access masks. Same per-call submission cost; same CPU fence wait. */
+  HRESULT STDMETHODCALLTYPE D3D11VkInterop::CopyExternalBufferToSurface(
+          VkBuffer                Src,
+          UINT64                  SrcSize,
+          UINT                    SrcRowPitch,
+          IDXGIVkInteropSurface*  pDst) {
+    if (!pDst || Src == VK_NULL_HANDLE)
+      return E_POINTER;
+
+    auto device = m_device->GetDXVKDevice();
+    auto vkd    = device->vkd();
+
+    VkImage           dstImage  = VK_NULL_HANDLE;
+    VkImageLayout     dstLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageCreateInfo dstInfo   = { };
+    dstInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    if (FAILED(pDst->GetVulkanImageInfo(&dstImage, &dstLayout, &dstInfo)) || !dstImage) {
+      Logger::err("D3D11VkInterop::CopyExternalBufferToSurface: GetVulkanImageInfo failed");
+      return E_FAIL;
+    }
+    if (!(dstInfo.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      static bool warned_once = false;
+      if (!warned_once) {
+        Logger::warn("D3D11VkInterop::CopyExternalBufferToSurface: dst image "
+                     "lacks VK_IMAGE_USAGE_TRANSFER_DST_BIT — DXVK contract changed?");
+        warned_once = true;
+      }
+      return E_FAIL;
+    }
+
+    /* Same DXVK-cooperative pattern as CopySurfaceToExternalBuffer:
+     * route layout transitions through DXVK's CS thread so its bookkeeping
+     * stays consistent (DCC compression metadata, shader-readable state,
+     * etc). Bypassing this with raw vkCmdPipelineBarrier on a private
+     * cmdbuf was the source of the dxvk-submit page faults observed
+     * pre-refactor. */
+    VkImageSubresourceRange range = {
+      VK_IMAGE_ASPECT_COLOR_BIT, 0, dstInfo.mipLevels, 0, dstInfo.arrayLayers
+    };
+
+    TransitionSurfaceLayout(pDst, &range, dstLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    FlushRenderingCommands();
+
+    device->lockSubmission();
+
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    poolInfo.queueFamilyIndex = device->queues().graphics.queueFamily;
+    poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    if (vkd->vkCreateCommandPool(vkd->device(), &poolInfo, nullptr, &pool) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopyExternalBufferToSurface: vkCreateCommandPool failed");
+      device->unlockSubmission();
+      TransitionSurfaceLayout(pDst, &range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstLayout);
+      FlushRenderingCommands();
+      return E_FAIL;
+    }
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cmdAlloc = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cmdAlloc.commandPool        = pool;
+    cmdAlloc.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    if (vkd->vkAllocateCommandBuffers(vkd->device(), &cmdAlloc, &cmd) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopyExternalBufferToSurface: vkAllocateCommandBuffers failed");
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      TransitionSurfaceLayout(pDst, &range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstLayout);
+      FlushRenderingCommands();
+      return E_FAIL;
+    }
+
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkd->vkBeginCommandBuffer(cmd, &begin);
+
+    /* Image is already in TRANSFER_DST_OPTIMAL via DXVK's transition above. */
+    constexpr uint32_t bytesPerPixel = 16; /* R32G32B32A32_FLOAT */
+    VkBufferImageCopy region = { };
+    region.bufferOffset      = 0;
+    region.bufferRowLength   = SrcRowPitch ? (SrcRowPitch / bytesPerPixel) : 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageOffset       = { 0, 0, 0 };
+    region.imageExtent       = dstInfo.extent;
+    vkd->vkCmdCopyBufferToImage(cmd, Src, dstImage,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    vkd->vkEndCommandBuffer(cmd);
+
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (vkd->vkCreateFence(vkd->device(), &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopyExternalBufferToSurface: vkCreateFence failed");
+      vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      return E_FAIL;
+    }
+
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers    = &cmd;
+    auto queue = device->queues().graphics.queueHandle;
+    if (vkd->vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS) {
+      Logger::err("D3D11VkInterop::CopyExternalBufferToSurface: vkQueueSubmit failed");
+      vkd->vkDestroyFence(vkd->device(), fence, nullptr);
+      vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+      vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+      device->unlockSubmission();
+      TransitionSurfaceLayout(pDst, &range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstLayout);
+      FlushRenderingCommands();
+      return E_FAIL;
+    }
+
+    vkd->vkWaitForFences(vkd->device(), 1, &fence, VK_TRUE, UINT64_MAX);
+
+    vkd->vkDestroyFence(vkd->device(), fence, nullptr);
+    vkd->vkFreeCommandBuffers(vkd->device(), pool, 1, &cmd);
+    vkd->vkDestroyCommandPool(vkd->device(), pool, nullptr);
+    device->unlockSubmission();
+
+    /* Hand the image back to DXVK in its original layout. */
+    TransitionSurfaceLayout(pDst, &range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstLayout);
+    FlushRenderingCommands();
+
+    static std::atomic<bool> first_reverse_logged { false };
+    bool expected = false;
+    if (first_reverse_logged.compare_exchange_strong(expected, true)) {
+      Logger::warn(str::format("D3D11VkInterop::CopyExternalBufferToSurface: "
+                               "first reverse blit submitted+waited OK ",
+                               dstInfo.extent.width, "x", dstInfo.extent.height,
+                               " fmt=", dstInfo.format,
+                               " pitch=", SrcRowPitch, " size=", SrcSize));
+    }
+    return S_OK;
   }
 
 

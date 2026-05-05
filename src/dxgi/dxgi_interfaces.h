@@ -498,6 +498,26 @@ IDXGIVkInteropDevice2 : public IDXGIVkInteropDevice1 {
   virtual void STDMETHODCALLTYPE FreeExternalBuffer(
           VkBuffer        Buffer,
           VkDeviceMemory  Memory) = 0;
+
+  /**
+   * \brief Copy an external buffer back into a DXVK image.
+   *
+   * Reverse of CopySurfaceToExternalBuffer — used by ZLUDA on
+   * cuGraphicsUnmapResources to propagate CUDA-written contents of the
+   * imported buffer back into DXVK's image so subsequent D3D11 sampling
+   * sees the new data. Synchronisation is CPU-side (CPU fence wait).
+   *
+   * \param [in] Src         Source buffer (must have TRANSFER_SRC usage)
+   * \param [in] SrcSize     Buffer size (bytes)
+   * \param [in] SrcRowPitch Pitch of source rows (bytes; 0 = tight pack)
+   * \param [in] pDst        Destination DXVK image (must have TRANSFER_DST usage)
+   * \returns S_OK on success
+   */
+  virtual HRESULT STDMETHODCALLTYPE CopyExternalBufferToSurface(
+          VkBuffer                Src,
+          UINT64                  SrcSize,
+          UINT                    SrcRowPitch,
+          IDXGIVkInteropSurface*  pDst) = 0;
 };
 
 /**
