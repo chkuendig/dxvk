@@ -249,13 +249,36 @@ namespace dxvk {
 
     /* GetVulkanImageInfo gives us the VkImage, the layout DXVK left it in,
      * and the original VkImageCreateInfo so we know extent + mip/array
-     * counts. */
+     * counts AND usage flags. */
     VkImage           srcImage  = VK_NULL_HANDLE;
     VkImageLayout     srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageCreateInfo srcInfo   = { };
     if (FAILED(pSrc->GetVulkanImageInfo(&srcImage, &srcLayout, &srcInfo)) || !srcImage) {
       Logger::err("D3D11VkInterop::CopySurfaceToExternalBuffer: GetVulkanImageInfo failed");
       return E_FAIL;
+    }
+
+    /* DXVK only sets VK_IMAGE_USAGE_TRANSFER_SRC_BIT on textures that have
+     * a use case for it (staging copies, mip generation, …). Batman's PhysX
+     * field-sampler textures are typically created as SRV+RTV with no
+     * transfer-src usage, which makes vkCmdCopyImageToBuffer illegal — we
+     * observed this manifesting as a UTCL2 page fault in dxvk-submit (TCP
+     * client, RW=write) on Steam Deck gfx1033. The principled fix needs
+     * either a parallel staging image (created with TRANSFER_SRC) that DXVK
+     * blits the original into, or an upstream DXVK hint to OR
+     * TRANSFER_SRC_BIT into texture creation when ZLUDA register hooks into
+     * the resource. Until that's wired, refuse the copy and let CUDA see
+     * the uninitialised buffer (same effective state as iter17b — register/
+     * import is still validated end-to-end). */
+    if (!(srcInfo.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+      static bool warned_once = false;
+      if (!warned_once) {
+        Logger::warn("D3D11VkInterop::CopySurfaceToExternalBuffer: source "
+                     "image lacks VK_IMAGE_USAGE_TRANSFER_SRC_BIT; "
+                     "imported memory will not be refreshed (warning logged once)");
+        warned_once = true;
+      }
+      return S_OK;
     }
 
     /* Drain DXVK's CS thread so any queued draws against the source image
