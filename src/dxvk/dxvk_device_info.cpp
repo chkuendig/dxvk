@@ -49,6 +49,10 @@ namespace dxvk {
     HANDLE_EXT(khrExternalMemoryWin32);            \
     HANDLE_EXT(khrExternalSemaphoreWin32);         \
     HANDLE_EXT(khrIncrementalPresent);             \
+    HANDLE_EXT(khrExternalMemoryFd);               \
+    HANDLE_EXT(extExternalMemoryDmaBuf);           \
+    HANDLE_EXT(khrExternalSemaphoreFd);            \
+    HANDLE_EXT(khrExternalFenceFd);                \
     HANDLE_EXT(khrLoadStoreOpNone);                \
     HANDLE_EXT(khrMaintenance5);                   \
     HANDLE_EXT(khrMaintenance6);                   \
@@ -1026,6 +1030,12 @@ namespace dxvk {
 
       /* Dirty rects for presentation */
       ENABLE_EXT(khrIncrementalPresent, false),
+
+      /* ZLUDA: Linux external-memory FD variants for D3D11<->CUDA interop */
+      ENABLE_EXT(khrExternalMemoryFd, false),
+      ENABLE_EXT(extExternalMemoryDmaBuf, false),
+      ENABLE_EXT(khrExternalSemaphoreFd, false),
+      ENABLE_EXT(khrExternalFenceFd, false),
 
       /* LOAD_OP_NONE for certain tiler optimizations. Core feature
        * in Vulkan 1.4, so probably supported by everything we need. */
